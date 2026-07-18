@@ -129,15 +129,16 @@ pub struct SwapExplain {
 /// (`binary-ternary.md` §2; RFC-0002 §5). This is an **independent** re-implementation of the
 /// `mycelium-cert::legal_pair` side-condition over `mycelium_core::ternary::max_magnitude`, so the
 /// `Recheck` mode's compile-time verdict has its **own** basis (it does not import the cert crate /
-/// trust the interpreter's cert). `i128` so the binary side never overflows the comparison.
+/// trust the interpreter's cert). `ternary::max_magnitude` is itself `i128`-typed since
+/// E-W1/M-1119, so the binary side's comparison never overflows without any local widening.
 #[must_use]
 pub fn legal_pair(width: u32, trits: u32) -> bool {
     let Some(tern_max) = ternary::max_magnitude(trits) else {
-        return false; // ternary side overflows i64 — far beyond any legal small pair
+        return false; // ternary side overflows i128 — far beyond any legal pair (m >= 81)
     };
     // 2^(n-1): the magnitude of the most-negative n-bit value, the binding constraint.
     let bin_max_neg_mag: i128 = 1i128 << width.saturating_sub(1);
-    bin_max_neg_mag <= i128::from(tern_max)
+    bin_max_neg_mag <= tern_max
 }
 
 /// The widest binary `n` the **i64** transcode arithmetic is sound for. The decode accumulates the

@@ -23,11 +23,11 @@ use mycelium_core::{ternary, GuaranteeStrength, Meta, Node, Payload, Provenance,
 use mycelium_interp::{Interpreter, PrimRegistry};
 use mycelium_numerics::Certificate;
 
-// Local variant: uses `int_to_trits(i64, u32)` — differs from the Vec<Trit> form in common.
+// Local variant: uses `int_to_trits(i128, u32)` — differs from the Vec<Trit> form in common.
 fn tern(value: i64, m: u32) -> Value {
     Value::new(
         Repr::Ternary { trits: m },
-        Payload::Trits(ternary::int_to_trits(value, m).unwrap()),
+        Payload::Trits(ternary::int_to_trits(i128::from(value), m).unwrap()),
         Meta::exact(Provenance::Root),
     )
     .unwrap()
