@@ -38,21 +38,21 @@ mlir-dialect = []
 bitnet-accel = []
 
 [dependencies]
-mycelium-core = { path = "../mycelium-core" }
+mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "781d3fcceba82acfe6b0eb46650513bd78a2416b" }
 # M-853 (RFC-0039 §5.1): the native Dense codegen (`dense_codegen.rs`) is differential-checked against
 # `mycelium-dense` (the trusted-base reference); it imports the reference's per-op relative-ε
 # constants (`F32_OP_REL_EPS`/`BF16_OP_REL_EPS`/`DENSE_MIN_NORMAL`) so the native bound it stamps is
 # the *same* value, never a divergent literal (DRY/VR-5). No cycle: `mycelium-dense` does not depend on
 # `mycelium-mlir`.
-mycelium-dense = { path = "../mycelium-dense" }
+mycelium-dense = { git = "https://github.com/tzervas/mycelium-value", rev = "fce92daed05e9f10202c202648ec43fb0a6991d7" }
 # M-854 (RFC-0039 §5.2): the native VSA codegen (`vsa_codegen.rs`) is differential-checked against
 # `mycelium-vsa` (the trusted-base reference) for the 1.0.0-mandatory MAP-I/BSC/HRR/FHRR models; it
 # imports the reference's `capacity::proven_capacity_bound` so the single-op MAP-I bundle Proven bound
 # is the *same* checked side-condition (never a divergent literal — DRY/VR-5), and refuses SBC/MAP-B
 # never-silently. No cycle: `mycelium-vsa` depends only on `mycelium-core`/`mycelium-select`, never on
 # `mycelium-mlir`.
-mycelium-vsa = { path = "../mycelium-vsa" }
-mycelium-interp = { path = "../mycelium-interp" }
+mycelium-vsa = { git = "https://github.com/tzervas/mycelium-value", rev = "fce92daed05e9f10202c202648ec43fb0a6991d7" }
+mycelium-interp = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
 # MEM-4 wiring (DN-33 / RFC-0027 §9): the RC-annotated IR + static analysis, and the runtime
 # reclamation-record contract the AOT tier emits the §9 audit trail into. Both are upstream of
 # `mlir` (they depend only on core / std-core / interp) — the dependency graph stays a DAG.
@@ -65,7 +65,7 @@ mycelium-mir-passes = { path = "../mycelium-mir-passes" }
 # M-861/M-864 work-stealing pool `mycelium-interp`'s own M-862 parallel-eval path and this crate's
 # M-860 `emit_llvm_ir_many` both dispatch through. No cycle (`mycelium-sched` sits below
 # `mycelium-interp`, which this crate already depends on).
-mycelium-sched = { path = "../mycelium-sched" }
+mycelium-sched = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
 # M-883/M-884 (runtime-ABI seam extraction): the reclamation EXPLAIN/audit record (RFC-0027 §9,
 # `rc_plan.rs`) and the structured-concurrency supervision surface (M-713 / RFC-0008 RT4·RT7,
 # `runtime.rs`'s `reclaim` driver, DN-58 §B / M-817) — relocated here from `mycelium-std-runtime`
@@ -74,14 +74,14 @@ mycelium-sched = { path = "../mycelium-sched" }
 # on core / interp / sched, all already depended on above), so this replaces the former
 # `mycelium-std-runtime` normal dependency entirely — `mycelium-mlir` no longer depends on
 # `mycelium-std-runtime` at all (normal or dev).
-mycelium-rt-abi = { path = "../mycelium-rt-abi" }
+mycelium-rt-abi = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
 # RFC-0041 W3½ (M-979): the AOT env-machine's control-stack depth ceiling + host-stack guard are now
 # the *shared* never-silent recursion budget/guard leaf every Mycelium machine charges against — the
 # ad-hoc `stack.len() >= max_depth` ceiling is replaced by `RecursionBudget::try_enter`, and the entry
 # is wrapped in `ensure_sufficient_stack`. `mycelium-workstack` is stratum 1 (below `mycelium-mlir` at
 # 4) and already a transitive dep via `mycelium-mir-passes`, so this direct edge is downward — no
 # deps-strata change (mlir's stratum = 1 + max(deps) is unchanged, mir-passes already contributing 2).
-mycelium-workstack = { path = "../mycelium-workstack" }
+mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "781d3fcceba82acfe6b0eb46650513bd78a2416b" }
 
 [dev-dependencies]
 # M-961: property tests for the inject-gate verify bounds (house rule: a property test per bound).
@@ -94,10 +94,10 @@ proptest = "1"
 # `mycelium-l1 -[dev]-> mycelium-mlir` edge instead; do not re-add the reverse edge.
 # The interp↔AOT differential (M-151) drives both paths with the certified binary↔ternary swap,
 # and since M-210 validates each pair through the shared TV checker (Certificate from numerics).
-mycelium-cert = { path = "../mycelium-cert" }
-mycelium-numerics = { path = "../mycelium-numerics" }
+mycelium-cert = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
+mycelium-numerics = { git = "https://github.com/tzervas/mycelium-value", rev = "fce92daed05e9f10202c202648ec43fb0a6991d7" }
 # The E3 wrong-layout differential (M-251) drives the layout chosen by the M-250 packing selector.
-mycelium-select = { path = "../mycelium-select" }
+mycelium-select = { git = "https://github.com/tzervas/mycelium-runtime", rev = "ab9cee665b620ed80ab74ea61ea639817dc49077" }
 # M-853 (RFC-0039 §5.1): the Dense three-way differential (`tests/dense_differential.rs`) uses
 # `DenseSpace` directly as the reference the native Dense codegen is checked against (the interpreter
 # has no `dense.*` prims — Dense is a standalone operational surface, like the cert swap). Already a
