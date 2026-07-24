@@ -3,7 +3,9 @@
 //! Exercises the native tail-Fix backend against the M-110 reference interpreter for terminating
 //! programs (value-equality), verifies the graceful depth-limit on non-terminating programs (both
 //! sides refuse explicitly, never crash/hang), and confirms refusals for out-of-scope shapes
-//! (FixGroup, non-tail Fix, non-λ.Match Fix body).
+//! (top-level FixGroup, non-tail Fix, non-λ.Match Fix body). Wave B1 lands Match-in-pre-tail on the
+//! iterative loop (see also `tests/recursion_b1.rs`); Wave B2 (`FixGroup` in Fix-arm bindings)
+//! remains a hard tested refuse.
 //!
 //! Guarantee tag: **Declared** — hand-written LLVM IR iterative loop; the differential is
 //! empirical evidence, not a proof (VR-5; never upgraded without a checked basis). Skips
@@ -289,12 +291,11 @@ fn countdown_interp_and_native_agree() {
     assert_eq!(native.repr(), &Repr::Binary { width: 8 });
 }
 
-/// Increment-3 review (Copilot #224): a tail-recursive arm whose **next step is computed via a
-/// nested `Match`** — a `Match` in the pre-tail binding sequence. `f = λn. Match n { Lit 0 → B ;
-/// default → App(self, Match n { Lit 2 → 1 ; _ → 0 }) }`, applied to `byte(2)`. The program is valid
-/// (the interpreter evaluates it 2 → 1 → 0 → B), but the **native** path refuses it: a `Match`
-/// introduces basic blocks that would invalidate the loop back-edge phi, so it is an explicit
-/// `UnsupportedNode` (deferred — DN-15 §8.5), never fragile IR (G2).
+/// Wave B1 (DN-15 §8.5): a tail-recursive arm whose **next step is computed via a nested `Match`**
+/// — a `Match` in the pre-tail binding sequence. `f = λn. Match n { Lit 0 → B ;
+/// default → App(self, Match n { Lit 2 → 1 ; _ → 0 }) }`, applied to `byte(2)`.
+/// Evaluates 2 → 1 → 0 → B on both interp and native (dedicated back-edge blocks keep the loop
+/// header phi well-formed).
 fn step_via_match_program() -> Node {
     // The recursion argument is itself a Match (a pre-tail binding after ANF flattening).
     let step_match = || Node::Match {
@@ -329,27 +330,93 @@ fn step_via_match_program() -> Node {
 }
 
 #[test]
-fn step_via_match_in_pre_tail_bindings_is_explicitly_refused() {
-    // Computing the next step via a nested `Match` puts a `Match` in the tail arm's pre-tail binding
-    // sequence. That introduces basic blocks which would invalidate the loop back-edge phi, so the
-    // native path REFUSES it explicitly (UnsupportedNode) — never fragile/incorrect IR (G2; DN-15
-    // §8.5 deferred). The interpreter evaluates it fine (it's a valid program); the boundary is a
-    // native-codegen limitation, honestly surfaced, not a semantic restriction.
+fn step_via_match_in_pre_tail_bindings_interp_and_native_agree() {
+    // Wave B1: Match-in-pre-tail lowers on the native tail-loop path and agrees with the interpreter.
     let prog = step_via_match_program();
-    match mycelium_mlir::compile_and_run(&prog) {
-        Err(AotError::UnsupportedNode(_)) => { /* expected explicit refusal */ }
-        Err(AotError::ToolchainMissing(_)) => { /* env skip */ }
-        Ok(v) => panic!(
-            "a Match-in-pre-tail-bindings program must be refused; native returned {:?}",
-            v.payload()
-        ),
-        Err(e) => panic!("step-via-match errored with an unexpected variant: {e}"),
-    }
-    // The interpreter still evaluates it (sanity: the program itself is well-formed).
-    assert!(
-        interp_bounded(&prog, 10_000).is_ok(),
-        "the interpreter should evaluate the (valid) step-via-match program"
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("native path errored on step-via-match (B1 must lower it): {e}"),
+    };
+    let interp = interp_bounded(&prog, 10_000).expect("interp must eval step-via-match");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "step-via-match: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
     );
+    assert_eq!(
+        native.payload(),
+        &Payload::Bits(B.to_vec()),
+        "step-via-match must produce byte(B)"
+    );
+}
+
+/// B2 residual: a `FixGroup` bound in a tail-Fix arm's pre-tail sequence must be a **hard, tested
+/// refuse** (`UnsupportedNode`) — never a silent miscompile (G2). Wave B2 will lift this.
+fn fixgroup_in_tail_fix_arm_program() -> Node {
+    let inner_group = Node::FixGroup {
+        defs: vec![
+            (
+                "g".into(),
+                Box::new(Node::Lam {
+                    param: "x".into(),
+                    body: Box::new(Node::Var("x".into())),
+                }),
+            ),
+            (
+                "h".into(),
+                Box::new(Node::Lam {
+                    param: "y".into(),
+                    body: Box::new(Node::Var("y".into())),
+                }),
+            ),
+        ],
+        body: Box::new(Node::Const(byte_n(0))),
+    };
+    let fix_body = Node::Lam {
+        param: "n".into(),
+        body: Box::new(Node::Match {
+            scrutinee: Box::new(Node::Var("n".into())),
+            alts: vec![Alt::Lit {
+                value: byte_n(0),
+                body: Node::Const(byte(B)),
+            }],
+            // Let-bind a FixGroup in the pre-tail sequence, then tail-call with a constant step.
+            default: Some(Box::new(Node::Let {
+                id: "grp".into(),
+                bound: Box::new(inner_group),
+                body: Box::new(Node::App {
+                    func: Box::new(Node::Var("self".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                }),
+            })),
+        }),
+    };
+    Node::App {
+        func: Box::new(Node::Fix {
+            name: "self".into(),
+            body: Box::new(fix_body),
+        }),
+        arg: Box::new(Node::Const(byte_n(1))),
+    }
+}
+
+#[test]
+fn fixgroup_in_tail_fix_arm_bindings_is_hard_refuse_b2() {
+    let prog = fixgroup_in_tail_fix_arm_program();
+    match mycelium_mlir::emit_llvm_ir(&prog) {
+        Err(AotError::UnsupportedNode(msg)) => {
+            assert!(
+                msg.contains("FixGroup") && (msg.contains("B2") || msg.contains("arm binding")),
+                "B2 residual message must name FixGroup (and Wave B2 / arm binding); got: {msg}"
+            );
+        }
+        other => panic!(
+            "FixGroup-in-Fix-arm-bindings must be a hard UnsupportedNode refuse; got {other:?}"
+        ),
+    }
 }
 
 /// One-step: interp and native agree (single default-arm iteration, then base B).

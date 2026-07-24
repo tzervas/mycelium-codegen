@@ -6,14 +6,16 @@
 //!
 //! [`crate::llvm`] already lowers **tail-position** single `Fix` to an iterative LLVM loop
 //! ([`crate::llvm::lower_tail_fix`]) — the host C stack is O(1) by construction (DN-15 §8.1). That
-//! covers the tail fragment but **refuses** (never-silent `AotError::UnsupportedNode`) non-tail
+//! covers the pure-tail / base fragment (Wave B1 also lowers a `Match` in the pre-tail binding
+//! sequence — DN-15 §8.5) but **refuses** (never-silent `AotError::UnsupportedNode`) non-tail
 //! recursion and `FixGroup`. This module is the **full defunctionalized heap trampoline** DN-15 §4.3
 //! anticipated: it runs object-level recursion on an **explicit heap control stack** (a `@malloc`'d
 //! frame stack), *not* the C stack, so a deep / non-terminating recursion is bounded by the
 //! **same [`AutoDepthBudget`]** the env-machine uses (DRY/KC-3 — reused, not re-invented; M-349) and
 //! refuses gracefully with the [`crate::llvm::DEPTHLIMIT_SENTINEL`] read-back, never a SIGSEGV or a
 //! hang (DN-05 #1; G2/SC-3). Keeping it file-disjoint from the tail-loop code is the M-850 ownership
-//! contract (the tail loop stays untouched and keeps its byte-for-byte IR).
+//! contract (the tail loop stays byte-stable for the pure-tail fragment; B1 only extends pre-tail
+//! bindings inside that path).
 //!
 //! ## The machine (mirror of [`crate::aot`]'s `Vec<Frame>` trampoline, in emitted IR)
 //!
@@ -967,10 +969,11 @@ fn packed_lit(value: &Value) -> Result<u64, AotError> {
 }
 
 /// Classify a destructured group: `true` iff it is a **single member** whose every arm is **tail or
-/// base** with **no `Match` in a pre-call binding** — i.e. exactly the fragment the fast iterative
-/// tail-loop ([`crate::llvm::lower_tail_fix`]) already handles byte-for-byte. `llvm.rs` uses this to
-/// keep the tail loop for that fragment and only reach for the heavier trampoline when it must
-/// (non-tail / `FixGroup` / Match-in-pre-call). Returns `Err` only on a genuinely out-of-scope shape
+/// base** — i.e. the fragment the fast iterative tail-loop ([`crate::llvm::lower_tail_fix`]) handles.
+/// Wave B1 (DN-15 §8.5): a `Match` in a pre-tail / pre-call binding is **no longer** a reason to leave
+/// the tail loop — the loop lowers it with dedicated back-edge blocks. `llvm.rs` uses this to keep
+/// the tail loop for that fragment and only reach for the heavier trampoline when it must (non-tail
+/// continuation / multi-member `FixGroup`). Returns `Err` only on a genuinely out-of-scope shape
 /// that *neither* path can lower (so the caller surfaces one honest refusal — G2).
 pub(crate) fn is_pure_tail_single_fix(members: &[Member]) -> Result<bool, AotError> {
     if members.len() != 1 {
@@ -981,12 +984,6 @@ pub(crate) fn is_pure_tail_single_fix(members: &[Member]) -> Result<bool, AotErr
     let mut all_tail_or_base = true;
     let arms_iter = m.arms.iter().map(|(_, a)| a).chain(m.default.iter());
     for arm in arms_iter {
-        // A `Match` in the arm's pre-call bindings forces the trampoline (the tail loop refuses it,
-        // DN-15 §8.5). Detect a nested Match anywhere in the arm body's binding RHSs.
-        if arm_has_nested_match(arm) {
-            all_tail_or_base = false;
-            continue;
-        }
         match analyze_arm(arm, &names, &m.param)? {
             ArmPlan::Base => {}
             ArmPlan::Call { cont, .. } => {
@@ -997,15 +994,6 @@ pub(crate) fn is_pure_tail_single_fix(members: &[Member]) -> Result<bool, AotErr
         }
     }
     Ok(all_tail_or_base)
-}
-
-/// Does the arm body contain a nested `Match` in any of its bindings (which the tail loop refuses,
-/// DN-15 §8.5, but the trampoline pre-call lowering also refuses — both route honestly)? This only
-/// distinguishes *which* path to try; a true result steers to the trampoline.
-fn arm_has_nested_match(anf: &Anf) -> bool {
-    anf.bindings()
-        .iter()
-        .any(|b| matches!(&b.rhs, Rhs::Match { .. }))
 }
 
 /// The heap-trampoline runtime: a thin `@malloc`/`@free` pair for the frame stack, emitted into the
