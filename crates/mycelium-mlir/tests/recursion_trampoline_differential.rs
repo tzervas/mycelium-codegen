@@ -4,8 +4,11 @@
 //! `Empirical`: it value-checks **interp ≡ direct-LLVM** over a recursion corpus the *tail*-loop path
 //! ([`recursion_differential.rs`]) cannot lower (non-tail continuations, `FixGroup`), confirms the
 //! deep-recursion ceiling reaches a graceful `DepthLimit` (no C-stack overflow — DN-05 #1; DN-15
-//! §8.4), and pins the still-refused boundaries (Match-in-pre-tail step, non-`λ.Match` shapes) as
-//! honest `UnsupportedNode` (G2/VR-5 — never a silent mis-lowering).
+//! §8.4), and pins residual refusals (Wave B2 `FixGroup`-in-arm-bindings lives in the tail-loop
+//! suite; trampoline pre-call still refuses non-straight-line shapes) as honest `UnsupportedNode`
+//! (G2/VR-5 — never a silent mis-lowering). Wave B1 moved pure-tail Match-in-pre-tail onto the
+//! iterative tail loop — see `match_in_pre_call_step_lowers_on_tail_loop_b1` and
+//! `tests/recursion_b1.rs`.
 //!
 //! Guarantee tag: **Empirical** — the differential below is checked (interp ≡ direct-LLVM over the
 //! corpus) and a `cargo-mutants` witness of the frame/continuation logic is caught by it (M-850
@@ -455,13 +458,10 @@ fn tail_fixgroup_divergence_is_graceful_depth_limit() {
     );
 }
 
-// ─── Still-refused boundaries (the honest edge — G2/VR-5) ────────────────────────────────────────
+// ─── Wave B1 boundary move: Match-in-pre-tail now lowers on the pure-tail path ──────────────────
 
-/// A `Match` in a recursive arm's **pre-call** (step-computing) binding sequence stays refused — the
-/// step computed via a nested `Match` (`App(self, Match n { … })`) introduces basic blocks the
-/// straight-line pre-call lowering does not handle (DN-15 §8.5, an *independently* deferred
-/// codegen-shape limitation distinct from the non-tail/FixGroup work M-850 lands). It is an explicit
-/// `UnsupportedNode`, never fragile IR; the reference interpreter still evaluates the (valid) program.
+/// Wave B1 (DN-15 §8.5): a pure-tail `Fix` whose step is computed via a nested `Match` lowers on
+/// the iterative tail-loop path (not the trampoline) and agrees with the interpreter.
 fn step_via_match_program() -> Node {
     let step_match = || Node::Match {
         scrutinee: Box::new(Node::Var("n".into())),
@@ -495,21 +495,28 @@ fn step_via_match_program() -> Node {
 }
 
 #[test]
-fn match_in_pre_call_step_stays_refused() {
+fn match_in_pre_call_step_lowers_on_tail_loop_b1() {
     let prog = step_via_match_program();
+    // Emission must succeed (toolchain-free gate) — Wave B1 lands Match-in-pre-tail on the tail loop.
+    let ir = mycelium_mlir::emit_llvm_ir(&prog)
+        .expect("Match-in-pre-tail pure-tail Fix must emit (Wave B1)");
+    // Pure-tail fragment: no heap-trampoline runtime (stays on the iterative loop).
     assert!(
-        matches!(
-            mycelium_mlir::emit_llvm_ir(&prog),
-            Err(AotError::UnsupportedNode(_))
-        ),
-        "a Match-in-pre-call-step program must be refused (UnsupportedNode); got {:?}",
-        mycelium_mlir::emit_llvm_ir(&prog)
+        !ir.contains("@myc_tramp_alloc"),
+        "a pure-tail Match-in-pre-tail program must stay on the tail loop, not the trampoline"
     );
-    // The program is well-formed: the interpreter evaluates it (2 → 1 → 0 → 0xAA). The boundary is a
-    // native-codegen limitation honestly surfaced, never a semantic restriction.
-    assert!(
-        interp_bounded(&prog, 100_000).is_ok(),
-        "the interpreter should evaluate the (valid) step-via-match program"
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("native step-via-match (B1) errored: {e}"),
+    };
+    let interp = interp_bounded(&prog, 100_000).expect("interp step-via-match");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "B1 step-via-match: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
     );
 }
 
