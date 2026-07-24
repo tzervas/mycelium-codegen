@@ -2,13 +2,13 @@
 //! single `Fix` and mutual-recursion `FixGroup`, run on an explicit `@malloc`'d control stack (never
 //! the C stack). This is the differential that promotes the trampoline tag from `Declared` to
 //! `Empirical`: it value-checks **interp ≡ direct-LLVM** over a recursion corpus the *tail*-loop path
-//! ([`recursion_differential.rs`]) cannot lower (non-tail continuations, `FixGroup`), confirms the
-//! deep-recursion ceiling reaches a graceful `DepthLimit` (no C-stack overflow — DN-05 #1; DN-15
-//! §8.4), and pins residual refusals (Wave B2 `FixGroup`-in-arm-bindings lives in the tail-loop
-//! suite; trampoline pre-call still refuses non-straight-line shapes) as honest `UnsupportedNode`
-//! (G2/VR-5 — never a silent mis-lowering). Wave B1 moved pure-tail Match-in-pre-tail onto the
-//! iterative tail loop — see `match_in_pre_call_step_lowers_on_tail_loop_b1` and
-//! `tests/recursion_b1.rs`.
+//! ([`recursion_differential.rs`]) cannot lower (non-tail continuations; multi-member top-level
+//! `FixGroup`), confirms the deep-recursion ceiling reaches a graceful `DepthLimit` (no C-stack
+//! overflow — DN-05 #1; DN-15 §8.4), and pins residual refusals (trampoline pre-call still refuses
+//! non-straight-line shapes such as nested `FixGroup`/`Match` — Wave-B2 residual on this path) as
+//! honest `UnsupportedNode` (G2/VR-5 — never a silent mis-lowering). Wave B1 moved pure-tail
+//! Match-in-pre-tail onto the iterative tail loop; Wave B2 suspends `FixGroup` in pure-tail Fix
+//! arm bindings — see `tests/recursion_b1.rs` / `tests/recursion_b2.rs`.
 //!
 //! Guarantee tag: **Empirical** — the differential below is checked (interp ≡ direct-LLVM over the
 //! corpus) and a `cargo-mutants` witness of the frame/continuation logic is caught by it (M-850

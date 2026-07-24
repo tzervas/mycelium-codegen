@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+### B2 — `FixGroup` in pure-tail `Fix` arm bindings (direct-LLVM)
+
+Closes the B1 residual where a `FixGroup` bound in a pure-tail `Fix` arm's
+pre-tail sequence was hard-refused on the iterative loop path
+(`crates/mycelium-mlir/src/llvm.rs`).
+
+**What now lowers**
+
+- A `FixGroup` in a pure-tail `Fix` arm binding sequence is **suspended** as
+  `EnvValue::FixGroup` (same as top-level / nested-block lowering — M-850).
+- Applying a group member nests the shared **heap trampoline** via `lower_app`
+  (no trampoline rewrite; extends B1 classification / SSA back-edge discipline).
+- The outer pure-tail `Fix` stays on the iterative loop; B1 dedicated back-edge
+  blocks keep the header phi well-formed when a nested trampoline introduces
+  blocks (SSA block-params).
+
+**Tests**
+
+- `tests/recursion_b2.rs` — unused suspension, mutual FixGroup as base, mutual
+  FixGroup feeding the pure-tail step: three-way interp ≡ env-machine ≡ native
+  when `llc`/`clang` are present; emission always gated.
+- `tests/recursion_differential.rs` — former FixGroup-in-arm refuse is now an
+  agree test; non-canonical top-level FixGroup refuse retained.
+- Residual pin: FixGroup in *trampoline* pre-call (non-tail Fix path) stays
+  `UnsupportedNode`.
+
+**B2 residual (honest refuse)**
+
+- Nested `FixGroup` / `Match` / other non-straight-line bindings in the
+  **trampoline** pre-call sequence (non-tail single-`Fix` path) remain
+  `AotError::UnsupportedNode` — only Binary{8} const/alias/op there (G2).
+
+**Docs**
+
+- Stale “FixGroup in arm bindings is refused / B2 residual” wording updated in
+  `llvm.rs`, `trampoline.rs`, and the recursion differential module docs.
+
 ### B1 — Match in pre-tail of a pure-tail `Fix` (direct-LLVM)
 
 Closes the native AOT gap where recursive programs using a nested `Match` to
@@ -24,16 +61,10 @@ compute the next tail step were hard-refused on the iterative loop path
   (Match-driven Binary{8} counters): three-way interp ≡ env-machine ≡ native
   when `llc`/`clang` are present; emission always gated.
 - `tests/recursion_differential.rs` — former refuse of step-via-Match is now
-  an agree test; B2 residual pin for `FixGroup` in Fix-arm bindings.
+  an agree test; Wave B2 lifts FixGroup-in-arm (see B2 section).
 - `tests/recursion_trampoline_differential.rs` — pure-tail Match-in-pre-tail
   stays on the tail loop (no `@myc_tramp_alloc`).
 - Unit: `is_pure_tail_single_fix` classifies Match-in-pre-tail as pure tail.
-
-**B2 residual (honest refuse)**
-
-- `FixGroup` in a tail-Fix arm binding sequence remains
-  `AotError::UnsupportedNode` with an explicit Wave-B2 residual message.
-  Covered by hard-refuse tests; never silently miscompiled.
 
 **Docs**
 
