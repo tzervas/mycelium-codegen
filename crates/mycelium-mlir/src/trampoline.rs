@@ -7,15 +7,16 @@
 //! [`crate::llvm`] already lowers **tail-position** single `Fix` to an iterative LLVM loop
 //! ([`crate::llvm::lower_tail_fix`]) — the host C stack is O(1) by construction (DN-15 §8.1). That
 //! covers the pure-tail / base fragment (Wave B1 also lowers a `Match` in the pre-tail binding
-//! sequence — DN-15 §8.5) but **refuses** (never-silent `AotError::UnsupportedNode`) non-tail
-//! recursion and `FixGroup`. This module is the **full defunctionalized heap trampoline** DN-15 §4.3
+//! sequence — DN-15 §8.5; Wave B2 suspends a `FixGroup` bound in that sequence and applies members
+//! via this trampoline). Non-tail single-`Fix` recursion and top-level multi-member `FixGroup`
+//! entry also land here. This module is the **full defunctionalized heap trampoline** DN-15 §4.3
 //! anticipated: it runs object-level recursion on an **explicit heap control stack** (a `@malloc`'d
 //! frame stack), *not* the C stack, so a deep / non-terminating recursion is bounded by the
 //! **same [`AutoDepthBudget`]** the env-machine uses (DRY/KC-3 — reused, not re-invented; M-349) and
 //! refuses gracefully with the [`crate::llvm::DEPTHLIMIT_SENTINEL`] read-back, never a SIGSEGV or a
 //! hang (DN-05 #1; G2/SC-3). Keeping it file-disjoint from the tail-loop code is the M-850 ownership
-//! contract (the tail loop stays byte-stable for the pure-tail fragment; B1 only extends pre-tail
-//! bindings inside that path).
+//! contract (the tail loop stays byte-stable for the pure-tail fragment; B1/B2 only extend pre-tail
+//! bindings inside that path without rewriting the trampoline).
 //!
 //! ## The machine (mirror of [`crate::aot`]'s `Vec<Frame>` trampoline, in emitted IR)
 //!
@@ -971,13 +972,15 @@ fn packed_lit(value: &Value) -> Result<u64, AotError> {
 /// Classify a destructured group: `true` iff it is a **single member** whose every arm is **tail or
 /// base** — i.e. the fragment the fast iterative tail-loop ([`crate::llvm::lower_tail_fix`]) handles.
 /// Wave B1 (DN-15 §8.5): a `Match` in a pre-tail / pre-call binding is **no longer** a reason to leave
-/// the tail loop — the loop lowers it with dedicated back-edge blocks. `llvm.rs` uses this to keep
-/// the tail loop for that fragment and only reach for the heavier trampoline when it must (non-tail
-/// continuation / multi-member `FixGroup`). Returns `Err` only on a genuinely out-of-scope shape
-/// that *neither* path can lower (so the caller surfaces one honest refusal — G2).
+/// the tail loop — the loop lowers it with dedicated back-edge blocks. Wave B2: a suspended
+/// `FixGroup` bound in a pure-tail arm is likewise not a reason to leave the loop (the group, when
+/// applied, nests this trampoline for the group members only). `llvm.rs` uses this to keep the tail
+/// loop for that fragment and only reach for the heavier trampoline when it must (non-tail
+/// continuation / multi-member top-level `FixGroup` entry). Returns `Err` only on a genuinely
+/// out-of-scope shape that *neither* path can lower (so the caller surfaces one honest refusal — G2).
 pub(crate) fn is_pure_tail_single_fix(members: &[Member]) -> Result<bool, AotError> {
     if members.len() != 1 {
-        return Ok(false); // a FixGroup is never the tail-loop fragment.
+        return Ok(false); // a multi-member FixGroup entry is never the single-Fix tail-loop fragment.
     }
     let m = &members[0];
     let names = [m.name.as_str()];

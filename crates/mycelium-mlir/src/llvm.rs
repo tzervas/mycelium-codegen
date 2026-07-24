@@ -759,13 +759,16 @@ pub(crate) fn lower_bindings_before_call_pub(
                     .collect::<Result<_, _>>()?;
                 EnvValue::Repr(emit_op(prim, &operands, ssa, body, flags)?)
             }
-            // A non-canonical pre-call construct (Swap/Construct/Match/Lam/Fix/App-to-non-member/
-            // FixGroup) is refused — the trampoline pre-call sequence is straight-line Binary{8}
-            // only; anything else is routed to the interpreter (never fragile IR — G2/VR-5).
+            // Residual after Wave B2: the *trampoline* pre-call sequence stays straight-line
+            // Binary{8} only. A nested `FixGroup`/`Match`/`Lam`/`Fix`/… here is still an honest
+            // refuse (never fragile IR — G2/VR-5). Wave B2 closed the pure-tail Fix arm-binding
+            // path (`lower_arm_bindings_before_tail`); this residual is the non-tail/trampoline
+            // pre-call only.
             other => {
                 return Err(AotError::UnsupportedNode(format!(
                     "trampoline: a non-straight-line pre-call binding ({}) is not supported in a \
-                     recursive arm — only Binary{{8}} const/alias/op before the call (G2)",
+                     recursive arm — only Binary{{8}} const/alias/op before the call \
+                     (Wave-B2 residual on the trampoline path; G2)",
                     rhs_kind(other)
                 )));
             }
@@ -896,8 +899,9 @@ fn lower_anf_block_ev(
             } => lower_match(
                 scrutinee, alts, default, env, ssa, bbc, body, funcs, flags, swap_mode,
             )?,
-            // Increment-2: closures are lowered inside match arms too (a `Lam`/`App` may appear in an
-            // arm body). Fix/FixGroup stay explicit UnsupportedNode (Increment-3; G2/VR-5).
+            // Increment-2/3 + Wave B2: closures, Fix, and FixGroup all lower inside nested blocks
+            // (match arms / base arms of a tail-Fix). Fix/FixGroup are suspended; App routes to
+            // the iterative loop or heap trampoline (M-850; G2/VR-5).
             Rhs::Lam {
                 param,
                 body: lam_body,
@@ -916,7 +920,8 @@ fn lower_anf_block_ev(
                     body: fix_body.clone(),
                 })
             }
-            // M-850: suspend the FixGroup member (consumed by a downstream App → heap-trampoline).
+            // M-850 / Wave B2: suspend the FixGroup member (consumed by a downstream App →
+            // heap-trampoline), including when bound inside a Fix arm.
             Rhs::FixGroup { defs, which } => EnvValue::FixGroup(FixGroupVal {
                 defs: defs.iter().map(|(n, d)| (n.clone(), d.clone())).collect(),
                 which: which.clone(),
@@ -1178,9 +1183,11 @@ fn lower_app(
     // M-850 (Wave-B): a non-tail single `Fix` routes to the **heap-trampoline** ([`crate::trampoline`])
     // — the full defunctionalized control-stack lowering DN-15 §4.3 anticipated. Wave B1: a pure-tail
     // single `Fix` whose arm pre-tail bindings contain a `Match` (DN-15 §8.5) stays on the fast
-    // iterative tail loop (dedicated back-edge blocks keep the header phi well-formed). Anything
-    // heavier (non-tail continuation, `FixGroup`) takes the trampoline. Both are bounded by the SAME
-    // `AutoDepthBudget` (DRY/KC-3).
+    // iterative tail loop (dedicated back-edge blocks keep the header phi well-formed). Wave B2: a
+    // pure-tail `Fix` whose pre-tail binds a `FixGroup` also stays on that loop (the group is
+    // suspended; an applied member may nest a trampoline for the group). Anything heavier (non-tail
+    // continuation, top-level multi-member group entry) takes the trampoline. Both are bounded by
+    // the SAME `AutoDepthBudget` (DRY/KC-3).
     if let EnvValue::Fix(fixval) = func_ev {
         let members = crate::trampoline::destructure_fix(&fixval.name, &fixval.body)?;
         if crate::trampoline::is_pure_tail_single_fix(&members)? {
@@ -1744,13 +1751,15 @@ fn lower_arm_bindings_before_tail(
                 flags,
                 SwapCertMode::Recheck,
             )?,
-            // B2 residual: FixGroup (mutual recursion) in a tail-Fix arm binding stays a hard,
-            // never-silent refuse — not silently miscompiled (G2). Wave B2 will lift this.
-            Rhs::FixGroup { .. } => return Err(AotError::UnsupportedNode(
-                "FixGroup in a tail-Fix arm binding sequence (mutual recursion — Wave B2 residual; \
-                     not yet lowered on the direct-LLVM tail-loop path; refused, never silent (G2))"
-                    .to_owned(),
-            )),
+            // Wave B2: suspend a `FixGroup` in the pre-tail binding sequence exactly as top-level
+            // and nested-block lowering do (M-850) — no IR yet. A downstream `App(member, init)`
+            // routes to the heap trampoline via `lower_app`. Dedicated B1 back-edge blocks keep the
+            // outer tail-loop header phi well-formed even when the nested trampoline introduces
+            // blocks (SSA block-params / phi discipline — never desynced predecessors; G2/VR-5).
+            Rhs::FixGroup { defs, which } => EnvValue::FixGroup(FixGroupVal {
+                defs: defs.iter().map(|(n, d)| (n.clone(), d.clone())).collect(),
+                which: which.clone(),
+            }),
         };
         env.insert(b.name.clone(), ev);
     }
@@ -1769,8 +1778,9 @@ fn lower_arm_bindings_before_tail(
 /// - **tail arm**: `App(self, step)` is the result — back-edge with the new accumulator.
 /// - **base arm**: no self-reference — exit the loop with the base result.
 ///
-/// Non-tail self-references, `FixGroup`, non-Binary{8} types, Ctor arms all return
-/// `UnsupportedNode` (G2).
+/// Non-tail self-references, non-Binary{8} types, Ctor arms all return `UnsupportedNode` (G2).
+/// Wave B2: a `FixGroup` bound in an arm's pre-tail sequence is suspended (then applied via the
+/// shared trampoline path); it is no longer a hard refuse of the whole arm.
 ///
 /// ## Loop structure (emitted IR)
 /// ```text
