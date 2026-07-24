@@ -3,9 +3,9 @@
 //! Exercises the native tail-Fix backend against the M-110 reference interpreter for terminating
 //! programs (value-equality), verifies the graceful depth-limit on non-terminating programs (both
 //! sides refuse explicitly, never crash/hang), and confirms refusals for out-of-scope shapes
-//! (top-level FixGroup, non-tail Fix, non-λ.Match Fix body). Wave B1 lands Match-in-pre-tail on the
-//! iterative loop (see also `tests/recursion_b1.rs`); Wave B2 (`FixGroup` in Fix-arm bindings)
-//! remains a hard tested refuse.
+//! (non-canonical top-level FixGroup, non-tail Fix on the *tail-loop* surface, non-λ.Match Fix body).
+//! Wave B1 lands Match-in-pre-tail on the iterative loop (see also `tests/recursion_b1.rs`); Wave B2
+//! lowers `FixGroup` in Fix-arm bindings (see also `tests/recursion_b2.rs`).
 //!
 //! Guarantee tag: **Declared** — hand-written LLVM IR iterative loop; the differential is
 //! empirical evidence, not a proof (VR-5; never upgraded without a checked basis). Skips
@@ -353,8 +353,8 @@ fn step_via_match_in_pre_tail_bindings_interp_and_native_agree() {
     );
 }
 
-/// B2 residual: a `FixGroup` bound in a tail-Fix arm's pre-tail sequence must be a **hard, tested
-/// refuse** (`UnsupportedNode`) — never a silent miscompile (G2). Wave B2 will lift this.
+/// Wave B2: a `FixGroup` bound in a tail-Fix arm's pre-tail sequence (unused here — suspension
+/// only) then a pure-tail self-call must **emit and run**, agreeing with the interpreter.
 fn fixgroup_in_tail_fix_arm_program() -> Node {
     let inner_group = Node::FixGroup {
         defs: vec![
@@ -404,19 +404,38 @@ fn fixgroup_in_tail_fix_arm_program() -> Node {
 }
 
 #[test]
-fn fixgroup_in_tail_fix_arm_bindings_is_hard_refuse_b2() {
+fn fixgroup_in_tail_fix_arm_bindings_emits_and_agrees_b2() {
     let prog = fixgroup_in_tail_fix_arm_program();
-    match mycelium_mlir::emit_llvm_ir(&prog) {
-        Err(AotError::UnsupportedNode(msg)) => {
-            assert!(
-                msg.contains("FixGroup") && (msg.contains("B2") || msg.contains("arm binding")),
-                "B2 residual message must name FixGroup (and Wave B2 / arm binding); got: {msg}"
-            );
-        }
-        other => panic!(
-            "FixGroup-in-Fix-arm-bindings must be a hard UnsupportedNode refuse; got {other:?}"
-        ),
-    }
+    let ir = mycelium_mlir::emit_llvm_ir(&prog)
+        .unwrap_or_else(|e| panic!("B2 FixGroup-in-arm must emit, got {e}"));
+    // Unused suspended FixGroup — outer pure-tail Fix stays on the iterative loop (no trampoline).
+    assert!(
+        !ir.contains("@myc_tramp_alloc"),
+        "unused FixGroup suspension must not force the outer Fix onto the trampoline"
+    );
+    assert!(
+        ir.contains("phi i64"),
+        "outer pure-tail Fix must still emit the header phi"
+    );
+
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("B2 FixGroup-in-arm native errored: {e}"),
+    };
+    let interp = interp_bounded(&prog, 10_000).expect("interp must eval B2 FixGroup-in-arm");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "B2 FixGroup-in-arm: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
+    );
+    assert_eq!(
+        native.payload(),
+        &Payload::Bits(B.to_vec()),
+        "B2 FixGroup-in-arm must produce byte(B)"
+    );
 }
 
 /// One-step: interp and native agree (single default-arm iteration, then base B).
@@ -487,16 +506,18 @@ fn diverging_native_is_depth_limit_never_hang() {
     );
 }
 
-/// `FixGroup` (mutual recursion) is always refused with `UnsupportedNode` (never silent — G2).
+/// A top-level `FixGroup` whose members are **not** the canonical `λ.Match` shape remains an
+/// honest `UnsupportedNode` refuse (never silent — G2). Canonical mutual recursion lives on the
+/// trampoline corpus (`tests/recursion_trampoline_differential.rs`); FixGroup-in-arm is Wave B2.
 #[test]
-fn fixgroup_is_unsupported_node() {
+fn non_canonical_fixgroup_is_unsupported_node() {
     let prog = fixgroup_program();
     assert!(
         matches!(
             mycelium_mlir::emit_llvm_ir(&prog),
             Err(AotError::UnsupportedNode(_))
         ),
-        "FixGroup must return UnsupportedNode; got {:?}",
+        "non-canonical FixGroup members must return UnsupportedNode; got {:?}",
         mycelium_mlir::emit_llvm_ir(&prog)
     );
 }
