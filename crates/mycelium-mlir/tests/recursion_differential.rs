@@ -438,6 +438,117 @@ fn fixgroup_in_tail_fix_arm_bindings_emits_and_agrees_b2() {
     );
 }
 
+/// Wave B2 (applied): a **mutually-recursive** `FixGroup` bound in a tail-Fix arm and then
+/// *applied* — the nested-trampoline path, not the mere suspension above. The unused case cannot
+/// catch a regression in applied FixGroup lowering (phi desync, wrong trampoline nesting, missing
+/// free on the back-edge), so the main differential gate must exercise the applied path directly.
+/// The base arm binds+applies a mutual even/odd group: `e(1) → o(0) → bit.not(e(0)) = !0xAA = 0x55`.
+fn fixgroup_applied_in_tail_fix_arm_program() -> Node {
+    let even = (
+        "e".to_string(),
+        Box::new(Node::Lam {
+            param: "x".into(),
+            body: Box::new(Node::Match {
+                scrutinee: Box::new(Node::Var("x".into())),
+                alts: vec![Alt::Lit {
+                    value: byte_n(0),
+                    body: Node::Const(byte_n(0xAA)),
+                }],
+                default: Some(Box::new(Node::App {
+                    func: Box::new(Node::Var("o".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                })),
+            }),
+        }),
+    );
+    let odd = (
+        "o".to_string(),
+        Box::new(Node::Lam {
+            param: "x".into(),
+            body: Box::new(Node::Match {
+                scrutinee: Box::new(Node::Var("x".into())),
+                alts: vec![Alt::Lit {
+                    value: byte_n(0),
+                    body: Node::Op {
+                        prim: "bit.not".into(),
+                        args: vec![Node::App {
+                            func: Box::new(Node::Var("e".into())),
+                            arg: Box::new(Node::Const(byte_n(0))),
+                        }],
+                    },
+                }],
+                default: Some(Box::new(Node::App {
+                    func: Box::new(Node::Var("e".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                })),
+            }),
+        }),
+    );
+    let group = Node::FixGroup {
+        defs: vec![even, odd],
+        body: Box::new(Node::App {
+            func: Box::new(Node::Var("e".into())),
+            arg: Box::new(Node::Const(byte_n(1))),
+        }),
+    };
+    let fix_body = Node::Lam {
+        param: "n".into(),
+        body: Box::new(Node::Match {
+            scrutinee: Box::new(Node::Var("n".into())),
+            alts: vec![Alt::Lit {
+                value: byte_n(0),
+                // Base arm: bind+apply the mutual group (nested trampoline).
+                body: group,
+            }],
+            default: Some(Box::new(Node::App {
+                func: Box::new(Node::Var("self".into())),
+                arg: Box::new(Node::Const(byte_n(0))),
+            })),
+        }),
+    };
+    Node::App {
+        func: Box::new(Node::Fix {
+            name: "self".into(),
+            body: Box::new(fix_body),
+        }),
+        arg: Box::new(Node::Const(byte_n(1))),
+    }
+}
+
+#[test]
+fn fixgroup_applied_in_tail_fix_arm_bindings_agrees_b2() {
+    let prog = fixgroup_applied_in_tail_fix_arm_program();
+    let ir = mycelium_mlir::emit_llvm_ir(&prog)
+        .unwrap_or_else(|e| panic!("B2 applied FixGroup-in-arm must emit, got {e}"));
+    // Applying the mutual group is the whole point: it must lower through the nested trampoline
+    // (contrast the unused-suspension case above, which asserts the trampoline is absent).
+    assert!(
+        ir.contains("@myc_tramp_alloc"),
+        "applied FixGroup must lower through the nested trampoline"
+    );
+
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("B2 applied FixGroup-in-arm native errored: {e}"),
+    };
+    let interp =
+        interp_bounded(&prog, 10_000).expect("interp must eval B2 applied FixGroup-in-arm");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "B2 applied FixGroup-in-arm: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
+    );
+    // e(1) → o(0) → bit.not(e(0)) = !0xAA = 0x55.
+    assert_eq!(
+        native.payload(),
+        byte_n(0x55).payload(),
+        "B2 applied FixGroup-in-arm must produce byte(0x55)"
+    );
+}
+
 /// One-step: interp and native agree (single default-arm iteration, then base B).
 #[test]
 fn one_step_interp_and_native_agree() {
