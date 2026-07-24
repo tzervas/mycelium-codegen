@@ -139,6 +139,40 @@ fn pure_tail_single_fix_is_classified_as_tail() {
     );
 }
 
+/// Wave B1: a pure-tail Fix whose step is a nested Match is still the tail-loop fragment (no
+/// trampoline steer). Mutant-witness: classifying it as non-pure would re-introduce the pre-B1
+/// refuse (trampoline pre-call still cannot lower Match).
+#[test]
+fn pure_tail_with_match_in_pre_tail_is_classified_as_tail() {
+    let step_match = Node::Match {
+        scrutinee: Box::new(Node::Var("n".into())),
+        alts: vec![Alt::Lit {
+            value: byte_n(2),
+            body: Node::Const(byte_n(1)),
+        }],
+        default: Some(Box::new(Node::Const(byte_n(0)))),
+    };
+    let body = Node::Lam {
+        param: "n".into(),
+        body: Box::new(Node::Match {
+            scrutinee: Box::new(Node::Var("n".into())),
+            alts: vec![Alt::Lit {
+                value: byte_n(0),
+                body: Node::Const(byte_n(0xAA)),
+            }],
+            default: Some(Box::new(Node::App {
+                func: Box::new(Node::Var("self".into())),
+                arg: Box::new(step_match),
+            })),
+        }),
+    };
+    let members = destructure_fix("self", &fix_body_anf(body)).expect("destructure");
+    assert!(
+        is_pure_tail_single_fix(&members).expect("classify"),
+        "Match-in-pre-tail pure-tail Fix must stay on the iterative tail loop (Wave B1)"
+    );
+}
+
 #[test]
 fn non_tail_single_fix_is_classified_as_trampoline() {
     // A non-tail (pending-op) arm forces the trampoline — `is_pure_tail_single_fix` must be false.

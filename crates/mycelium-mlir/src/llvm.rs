@@ -1175,11 +1175,12 @@ fn lower_app(
 ) -> Result<EnvValue, AotError> {
     let func_ev = lookup_ev(env, func)?;
     // Increment-3: App(Fix, init) → iterative tail-recursion loop (never stack recursion; DN-05 #1).
-    // M-850 (Wave-B): a non-tail single `Fix` (or a `Match` in a pre-call binding — DN-15 §8.5) no
-    // longer refuses; it routes to the **heap-trampoline** ([`crate::trampoline`]) — the full
-    // defunctionalized control-stack lowering DN-15 §4.3 anticipated. The fast iterative tail loop is
-    // kept (byte-identical IR) for the pure-tail/base fragment it already handled; anything heavier
-    // takes the trampoline. Both are bounded by the SAME `AutoDepthBudget` (DRY/KC-3).
+    // M-850 (Wave-B): a non-tail single `Fix` routes to the **heap-trampoline** ([`crate::trampoline`])
+    // — the full defunctionalized control-stack lowering DN-15 §4.3 anticipated. Wave B1: a pure-tail
+    // single `Fix` whose arm pre-tail bindings contain a `Match` (DN-15 §8.5) stays on the fast
+    // iterative tail loop (dedicated back-edge blocks keep the header phi well-formed). Anything
+    // heavier (non-tail continuation, `FixGroup`) takes the trampoline. Both are bounded by the SAME
+    // `AutoDepthBudget` (DRY/KC-3).
     if let EnvValue::Fix(fixval) = func_ev {
         let members = crate::trampoline::destructure_fix(&fixval.name, &fixval.body)?;
         if crate::trampoline::is_pure_tail_single_fix(&members)? {
@@ -1402,7 +1403,14 @@ fn lower_match(
             flags,
             swap_mode,
         )?;
-        phi_entries.push((label.clone(), arm_result));
+        // Dedicated join block as the merge-phi predecessor (Wave B1 / DN-15 §8.5). The arm body may
+        // itself contain a nested `Match` (which introduces basic blocks), so branching to `%merge`
+        // from whatever block `lower_anf_block` left "current" would desync the merge phi if we
+        // listed `%{label}` as the predecessor. A fresh join is always the true predecessor.
+        let join = bbc.fresh();
+        let _ = writeln!(body, "  br label %{join}");
+        let _ = writeln!(body, "{join}:");
+        phi_entries.push((join, arm_result));
         let _ = writeln!(body, "  br label %{merge_label}");
     }
 
@@ -1419,7 +1427,11 @@ fn lower_match(
             flags,
             swap_mode,
         )?;
-        phi_entries.push((default_label.clone(), default_result));
+        // Same join-block discipline as Lit/Ctor arms (nested Match in the default is legal).
+        let join = bbc.fresh();
+        let _ = writeln!(body, "  br label %{join}");
+        let _ = writeln!(body, "{join}:");
+        phi_entries.push((join, default_result));
         let _ = writeln!(body, "  br label %{merge_label}");
     } else {
         let _ = writeln!(body, "  call void @abort()");
@@ -1711,22 +1723,32 @@ fn lower_arm_bindings_before_tail(
                 name: name.clone(),
                 body: fix_body.clone(),
             }),
-            // A `Match` in the pre-tail binding sequence (e.g. computing the next step via a Match)
-            // is refused for now. `lower_match` introduces basic blocks, so the loop's back-edge
-            // would branch from the Match's merge block rather than the recorded `recur` label — the
-            // back-edge `phi` then has stale predecessors (LLVM "PHI node entries do not match
-            // predecessors"). Supporting it needs current-block tracking threaded through the
-            // back-edge; deferred (DN-15 §8.5). Explicit refusal, never fragile/incorrect IR (G2/VR-5).
-            Rhs::Match { .. } => return Err(AotError::UnsupportedNode(
-                "a Match in a tail-Fix arm's pre-tail binding sequence (e.g. computing the next \
-                     step via a Match) is not yet supported — it introduces basic blocks that \
-                     invalidate the loop back-edge phi; deferred (DN-15 §8.5)"
-                    .to_owned(),
-            )),
-            // FixGroup (mutual recursion) stays deferred — explicit refusal, never silent (G2).
+            // Wave B1 (DN-15 §8.5): a `Match` in the pre-tail binding sequence (e.g. computing the
+            // next step via a Match) is lowered with the shared `lower_match`. The tail-loop emitter
+            // (`lower_tail_fix`) places each back-edge in a **dedicated** recur block so the header
+            // phi's predecessors stay well-formed even when `lower_match` introduces basic blocks
+            // (never "PHI node entries do not match predecessors" — G2/VR-5).
+            Rhs::Match {
+                scrutinee,
+                alts,
+                default,
+            } => lower_match(
+                scrutinee,
+                alts,
+                default,
+                env,
+                ssa,
+                bbc,
+                body,
+                funcs,
+                flags,
+                SwapCertMode::Recheck,
+            )?,
+            // B2 residual: FixGroup (mutual recursion) in a tail-Fix arm binding stays a hard,
+            // never-silent refuse — not silently miscompiled (G2). Wave B2 will lift this.
             Rhs::FixGroup { .. } => return Err(AotError::UnsupportedNode(
-                "FixGroup in a tail-Fix arm binding sequence (mutual recursion — deferred to a \
-                     later increment)"
+                "FixGroup in a tail-Fix arm binding sequence (mutual recursion — Wave B2 residual; \
+                     not yet lowered on the direct-LLVM tail-loop path; refused, never silent (G2))"
                     .to_owned(),
             )),
         };
@@ -1902,70 +1924,53 @@ fn lower_tail_fix(
     // We emit placeholder phi strings now and back-patch after classifying arms; instead, we
     // structure the emission so that phi operands are collected first, then emitted.
     //
-    // Collect recur arm labels (for the back-edges on the phi).
-    let recur_arm_labels: Vec<String> = arm_kinds
+    // Count tail (back-edge) arms. Wave B1: each back-edge lands in a **dedicated** recur block
+    // (not the arm/default label itself) so a `Match` in the pre-tail binding sequence can introduce
+    // basic blocks without desyncing the header phi predecessors (DN-15 §8.5).
+    let tail_arm_count = arm_kinds
         .iter()
-        .zip(&arm_labels)
-        .filter(|((_, _, kind), _)| matches!(kind, ArmKind::Tail(_)))
-        .map(|(_, lbl)| lbl.clone())
-        .collect();
-    let recur_default_label: Option<String> = default_kind
+        .filter(|(_, _, kind)| matches!(kind, ArmKind::Tail(_)))
+        .count();
+    let tail_default = default_kind
         .as_ref()
-        .and_then(|(_, kind)| matches!(kind, ArmKind::Tail(_)).then(|| default_label.clone()));
+        .is_some_and(|(_, kind)| matches!(kind, ArmKind::Tail(_)));
+    let all_recur_count = tail_arm_count + usize::from(tail_default);
 
     // The packed-n phi: %n_packed = phi i64 [%init, %entry_label], [%next_k, %recur_k]...
-    // We emit the phi header now with just the entry edge; back-edges are added after loop body.
-    // HOWEVER, LLVM requires complete phi operand lists — so we must use SSA registers that we
-    // declare in the recur arm blocks. We do this by pre-assigning SSA names for the "next"
-    // registers and the "depth1" registers that will be defined in each recur arm block.
+    // LLVM requires complete phi operand lists — pre-assign SSA names for the "next" and "depth1"
+    // registers, plus dedicated back-edge block labels, defined in each recur block.
     let n_packed_phi = ssa.fresh();
     let depth_phi = ssa.fresh();
 
-    // Pre-assign "next" packed values + "depth1" values for each recur arm.
-    // We know which arms are tail calls; for each we reserve two SSA names now.
-    let mut recur_next_regs: Vec<String> = Vec::new();
-    let mut recur_depth1_regs: Vec<String> = Vec::new();
-    let all_recur_count = recur_arm_labels.len() + recur_default_label.as_ref().map_or(0, |_| 1);
+    let mut recur_next_regs: Vec<String> = Vec::with_capacity(all_recur_count);
+    let mut recur_depth1_regs: Vec<String> = Vec::with_capacity(all_recur_count);
+    let mut recur_backedge_labels: Vec<String> = Vec::with_capacity(all_recur_count);
     for _ in 0..all_recur_count {
         recur_next_regs.push(ssa.fresh());
         recur_depth1_regs.push(ssa.fresh());
+        recur_backedge_labels.push(bbc.fresh());
     }
 
     let _ = writeln!(body, "{header_label}:");
-    // Build the phi for %n_packed.
+    // Build the phi for %n_packed — predecessors are entry + each dedicated back-edge block.
     {
         let mut phi_args = format!("[ {init_packed}, %{entry_label} ]");
-        let mut ri = 0;
-        for ((_, _, kind), lbl) in arm_kinds.iter().zip(&arm_labels) {
-            if matches!(kind, ArmKind::Tail(_)) {
-                phi_args.push_str(&format!(", [ {}, %{lbl} ]", recur_next_regs[ri]));
-                ri += 1;
-            }
-        }
-        if let Some((_, kind)) = &default_kind {
-            if matches!(kind, ArmKind::Tail(_)) {
-                phi_args.push_str(&format!(", [ {}, %{default_label} ]", recur_next_regs[ri]));
-            }
+        for ri in 0..all_recur_count {
+            phi_args.push_str(&format!(
+                ", [ {}, %{} ]",
+                recur_next_regs[ri], recur_backedge_labels[ri]
+            ));
         }
         let _ = writeln!(body, "  {n_packed_phi} = phi i64 {phi_args}");
     }
     // Build the phi for %depth.
     {
         let mut phi_args = format!("[ 0, %{entry_label} ]");
-        let mut ri = 0;
-        for ((_, _, kind), lbl) in arm_kinds.iter().zip(&arm_labels) {
-            if matches!(kind, ArmKind::Tail(_)) {
-                phi_args.push_str(&format!(", [ {}, %{lbl} ]", recur_depth1_regs[ri]));
-                ri += 1;
-            }
-        }
-        if let Some((_, kind)) = &default_kind {
-            if matches!(kind, ArmKind::Tail(_)) {
-                phi_args.push_str(&format!(
-                    ", [ {}, %{default_label} ]",
-                    recur_depth1_regs[ri]
-                ));
-            }
+        for ri in 0..all_recur_count {
+            phi_args.push_str(&format!(
+                ", [ {}, %{} ]",
+                recur_depth1_regs[ri], recur_backedge_labels[ri]
+            ));
         }
         let _ = writeln!(body, "  {depth_phi} = phi i64 {phi_args}");
     }
@@ -2027,11 +2032,18 @@ fn lower_tail_fix(
                     flags,
                     SwapCertMode::Recheck,
                 )?;
-                exit_phi_entries.push((lbl.clone(), result_lane));
+                // Dedicated join so a nested Match inside a base arm does not desync the exit phi
+                // (same Wave B1 / DN-15 §8.5 discipline as the Match merge joins).
+                let join = bbc.fresh();
+                let _ = writeln!(body, "  br label %{join}");
+                let _ = writeln!(body, "{join}:");
+                exit_phi_entries.push((join, result_lane));
                 let _ = writeln!(body, "  br label %{exit_label}");
             }
             ArmKind::Tail(step_atom) => {
-                // Lower bindings BEFORE the tail App (the step computation).
+                // Lower bindings BEFORE the tail App (the step computation). May include a `Match`
+                // (Wave B1) — that leaves IR in the Match merge block; the dedicated back-edge
+                // block below is the sole header-phi predecessor for this arm.
                 lower_arm_bindings_before_tail(
                     arm_anf,
                     &mut arm_env,
@@ -2044,8 +2056,12 @@ fn lower_tail_fix(
                 // Look up the step atom from the arm env.
                 let step_ev = lookup_ev(&arm_env, step_atom)?;
                 let step_lane = as_binary8(step_ev, "tail-Fix step argument")?.clone();
-                // Emit the "next" packed value and "depth+1" using the pre-reserved SSA regs.
+                // Pack the step in the current block (possibly a Match merge), then hop to the
+                // dedicated back-edge block that defines the pre-reserved phi operands.
                 let next_packed = pack_binary8(&step_lane, ssa, body);
+                let backedge = &recur_backedge_labels[recur_idx];
+                let _ = writeln!(body, "  br label %{backedge}");
+                let _ = writeln!(body, "{backedge}:");
                 // Copy packed value into the pre-reserved register via an `or i64 <val>, 0`.
                 let _ = writeln!(
                     body,
@@ -2082,7 +2098,11 @@ fn lower_tail_fix(
                     flags,
                     SwapCertMode::Recheck,
                 )?;
-                exit_phi_entries.push((default_label.clone(), result_lane));
+                // Join block so a nested Match in the default base does not desync the exit phi.
+                let join = bbc.fresh();
+                let _ = writeln!(body, "  br label %{join}");
+                let _ = writeln!(body, "{join}:");
+                exit_phi_entries.push((join, result_lane));
                 let _ = writeln!(body, "  br label %{exit_label}");
             }
             Some((def_anf, ArmKind::Tail(step_atom))) => {
@@ -2098,6 +2118,9 @@ fn lower_tail_fix(
                 let step_ev = lookup_ev(&def_env, step_atom)?;
                 let step_lane = as_binary8(step_ev, "tail-Fix default step argument")?.clone();
                 let next_packed = pack_binary8(&step_lane, ssa, body);
+                let backedge = &recur_backedge_labels[recur_idx];
+                let _ = writeln!(body, "  br label %{backedge}");
+                let _ = writeln!(body, "{backedge}:");
                 let _ = writeln!(
                     body,
                     "  {} = or i64 {next_packed}, 0",
