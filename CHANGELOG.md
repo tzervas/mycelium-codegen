@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Deps — pin `mycelium-runtime` at A1 (`wild:` host-op registry)
+
+Advances every `tzervas/mycelium-runtime` `rev` pin in this workspace to
+`4e8125b231a78d14e0c882677b81b7048887a593` (A1 / runtime#6). Required so a
+downstream pin-bump of this crate onto B1/B2 cannot put two copies of
+`mycelium-interp` in one cargo graph (single-version invariant). AOT still
+dispatches `wild:` through `PrimRegistry` (A1 residual); the L0 interpreter
+path in the pinned runtime uses `HostOpRegistry`.
+
 ### B2 — `FixGroup` in pure-tail `Fix` arm bindings (direct-LLVM)
 
 Closes the B1 residual where a `FixGroup` bound in a pure-tail `Fix` arm's
