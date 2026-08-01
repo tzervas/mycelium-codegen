@@ -38,7 +38,7 @@ mlir-dialect = []
 bitnet-accel = []
 
 [dependencies]
-mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "3958d2ea3c3921611e33f1f00e3469b29a939a76" }
 # M-853 (RFC-0039 §5.1): the native Dense codegen (`dense_codegen.rs`) is differential-checked against
 # `mycelium-dense` (the trusted-base reference); it imports the reference's per-op relative-ε
 # constants (`F32_OP_REL_EPS`/`BF16_OP_REL_EPS`/`DENSE_MIN_NORMAL`) so the native bound it stamps is
@@ -81,7 +81,7 @@ mycelium-rt-abi = { git = "https://github.com/tzervas/mycelium-runtime", rev = "
 # is wrapped in `ensure_sufficient_stack`. `mycelium-workstack` is stratum 1 (below `mycelium-mlir` at
 # 4) and already a transitive dep via `mycelium-mir-passes`, so this direct edge is downward — no
 # deps-strata change (mlir's stratum = 1 + max(deps) is unchanged, mir-passes already contributing 2).
-mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "3958d2ea3c3921611e33f1f00e3469b29a939a76" }
 
 [dev-dependencies]
 # M-961: property tests for the inject-gate verify bounds (house rule: a property test per bound).

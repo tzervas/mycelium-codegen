@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 # Consumes the trusted Core IR (Node grammar) — read-only; never mutated.
-mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-core = { git = "https://github.com/tzervas/mycelium-core", rev = "3958d2ea3c3921611e33f1f00e3469b29a939a76" }
 # RFC-0041 (Wave-1) shared recursion budget + guarded-stack leaf — closes the guard holes in
 # `emit_owned`/`count_occurrences` (RR-29 / §4.7). Downward-only (DN-68); never mutated.
-mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "46d2515cbd86d2ae4d1365f4adcd2796737e9f0b" }
+mycelium-workstack = { git = "https://github.com/tzervas/mycelium-core", rev = "3958d2ea3c3921611e33f1f00e3469b29a939a76" }
