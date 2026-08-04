@@ -3,7 +3,9 @@
 //! Exercises the native tail-Fix backend against the M-110 reference interpreter for terminating
 //! programs (value-equality), verifies the graceful depth-limit on non-terminating programs (both
 //! sides refuse explicitly, never crash/hang), and confirms refusals for out-of-scope shapes
-//! (FixGroup, non-tail Fix, non-λ.Match Fix body).
+//! (non-canonical top-level FixGroup, non-tail Fix on the *tail-loop* surface, non-λ.Match Fix body).
+//! Wave B1 lands Match-in-pre-tail on the iterative loop (see also `tests/recursion_b1.rs`); Wave B2
+//! lowers `FixGroup` in Fix-arm bindings (see also `tests/recursion_b2.rs`).
 //!
 //! Guarantee tag: **Declared** — hand-written LLVM IR iterative loop; the differential is
 //! empirical evidence, not a proof (VR-5; never upgraded without a checked basis). Skips
@@ -289,12 +291,11 @@ fn countdown_interp_and_native_agree() {
     assert_eq!(native.repr(), &Repr::Binary { width: 8 });
 }
 
-/// Increment-3 review (Copilot #224): a tail-recursive arm whose **next step is computed via a
-/// nested `Match`** — a `Match` in the pre-tail binding sequence. `f = λn. Match n { Lit 0 → B ;
-/// default → App(self, Match n { Lit 2 → 1 ; _ → 0 }) }`, applied to `byte(2)`. The program is valid
-/// (the interpreter evaluates it 2 → 1 → 0 → B), but the **native** path refuses it: a `Match`
-/// introduces basic blocks that would invalidate the loop back-edge phi, so it is an explicit
-/// `UnsupportedNode` (deferred — DN-15 §8.5), never fragile IR (G2).
+/// Wave B1 (DN-15 §8.5): a tail-recursive arm whose **next step is computed via a nested `Match`**
+/// — a `Match` in the pre-tail binding sequence. `f = λn. Match n { Lit 0 → B ;
+/// default → App(self, Match n { Lit 2 → 1 ; _ → 0 }) }`, applied to `byte(2)`.
+/// Evaluates 2 → 1 → 0 → B on both interp and native (dedicated back-edge blocks keep the loop
+/// header phi well-formed).
 fn step_via_match_program() -> Node {
     // The recursion argument is itself a Match (a pre-tail binding after ANF flattening).
     let step_match = || Node::Match {
@@ -329,26 +330,222 @@ fn step_via_match_program() -> Node {
 }
 
 #[test]
-fn step_via_match_in_pre_tail_bindings_is_explicitly_refused() {
-    // Computing the next step via a nested `Match` puts a `Match` in the tail arm's pre-tail binding
-    // sequence. That introduces basic blocks which would invalidate the loop back-edge phi, so the
-    // native path REFUSES it explicitly (UnsupportedNode) — never fragile/incorrect IR (G2; DN-15
-    // §8.5 deferred). The interpreter evaluates it fine (it's a valid program); the boundary is a
-    // native-codegen limitation, honestly surfaced, not a semantic restriction.
+fn step_via_match_in_pre_tail_bindings_interp_and_native_agree() {
+    // Wave B1: Match-in-pre-tail lowers on the native tail-loop path and agrees with the interpreter.
     let prog = step_via_match_program();
-    match mycelium_mlir::compile_and_run(&prog) {
-        Err(AotError::UnsupportedNode(_)) => { /* expected explicit refusal */ }
-        Err(AotError::ToolchainMissing(_)) => { /* env skip */ }
-        Ok(v) => panic!(
-            "a Match-in-pre-tail-bindings program must be refused; native returned {:?}",
-            v.payload()
-        ),
-        Err(e) => panic!("step-via-match errored with an unexpected variant: {e}"),
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("native path errored on step-via-match (B1 must lower it): {e}"),
+    };
+    let interp = interp_bounded(&prog, 10_000).expect("interp must eval step-via-match");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "step-via-match: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
+    );
+    assert_eq!(
+        native.payload(),
+        &Payload::Bits(B.to_vec()),
+        "step-via-match must produce byte(B)"
+    );
+}
+
+/// Wave B2: a `FixGroup` bound in a tail-Fix arm's pre-tail sequence (unused here — suspension
+/// only) then a pure-tail self-call must **emit and run**, agreeing with the interpreter.
+fn fixgroup_in_tail_fix_arm_program() -> Node {
+    let inner_group = Node::FixGroup {
+        defs: vec![
+            (
+                "g".into(),
+                Box::new(Node::Lam {
+                    param: "x".into(),
+                    body: Box::new(Node::Var("x".into())),
+                }),
+            ),
+            (
+                "h".into(),
+                Box::new(Node::Lam {
+                    param: "y".into(),
+                    body: Box::new(Node::Var("y".into())),
+                }),
+            ),
+        ],
+        body: Box::new(Node::Const(byte_n(0))),
+    };
+    let fix_body = Node::Lam {
+        param: "n".into(),
+        body: Box::new(Node::Match {
+            scrutinee: Box::new(Node::Var("n".into())),
+            alts: vec![Alt::Lit {
+                value: byte_n(0),
+                body: Node::Const(byte(B)),
+            }],
+            // Let-bind a FixGroup in the pre-tail sequence, then tail-call with a constant step.
+            default: Some(Box::new(Node::Let {
+                id: "grp".into(),
+                bound: Box::new(inner_group),
+                body: Box::new(Node::App {
+                    func: Box::new(Node::Var("self".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                }),
+            })),
+        }),
+    };
+    Node::App {
+        func: Box::new(Node::Fix {
+            name: "self".into(),
+            body: Box::new(fix_body),
+        }),
+        arg: Box::new(Node::Const(byte_n(1))),
     }
-    // The interpreter still evaluates it (sanity: the program itself is well-formed).
+}
+
+#[test]
+fn fixgroup_in_tail_fix_arm_bindings_emits_and_agrees_b2() {
+    let prog = fixgroup_in_tail_fix_arm_program();
+    let ir = mycelium_mlir::emit_llvm_ir(&prog)
+        .unwrap_or_else(|e| panic!("B2 FixGroup-in-arm must emit, got {e}"));
+    // Unused suspended FixGroup — outer pure-tail Fix stays on the iterative loop (no trampoline).
     assert!(
-        interp_bounded(&prog, 10_000).is_ok(),
-        "the interpreter should evaluate the (valid) step-via-match program"
+        !ir.contains("@myc_tramp_alloc"),
+        "unused FixGroup suspension must not force the outer Fix onto the trampoline"
+    );
+    assert!(
+        ir.contains("phi i64"),
+        "outer pure-tail Fix must still emit the header phi"
+    );
+
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("B2 FixGroup-in-arm native errored: {e}"),
+    };
+    let interp = interp_bounded(&prog, 10_000).expect("interp must eval B2 FixGroup-in-arm");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "B2 FixGroup-in-arm: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
+    );
+    assert_eq!(
+        native.payload(),
+        &Payload::Bits(B.to_vec()),
+        "B2 FixGroup-in-arm must produce byte(B)"
+    );
+}
+
+/// Wave B2 (applied): a **mutually-recursive** `FixGroup` bound in a tail-Fix arm and then
+/// *applied* — the nested-trampoline path, not the mere suspension above. The unused case cannot
+/// catch a regression in applied FixGroup lowering (phi desync, wrong trampoline nesting, missing
+/// free on the back-edge), so the main differential gate must exercise the applied path directly.
+/// The base arm binds+applies a mutual even/odd group: `e(1) → o(0) → bit.not(e(0)) = !0xAA = 0x55`.
+fn fixgroup_applied_in_tail_fix_arm_program() -> Node {
+    let even = (
+        "e".to_string(),
+        Box::new(Node::Lam {
+            param: "x".into(),
+            body: Box::new(Node::Match {
+                scrutinee: Box::new(Node::Var("x".into())),
+                alts: vec![Alt::Lit {
+                    value: byte_n(0),
+                    body: Node::Const(byte_n(0xAA)),
+                }],
+                default: Some(Box::new(Node::App {
+                    func: Box::new(Node::Var("o".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                })),
+            }),
+        }),
+    );
+    let odd = (
+        "o".to_string(),
+        Box::new(Node::Lam {
+            param: "x".into(),
+            body: Box::new(Node::Match {
+                scrutinee: Box::new(Node::Var("x".into())),
+                alts: vec![Alt::Lit {
+                    value: byte_n(0),
+                    body: Node::Op {
+                        prim: "bit.not".into(),
+                        args: vec![Node::App {
+                            func: Box::new(Node::Var("e".into())),
+                            arg: Box::new(Node::Const(byte_n(0))),
+                        }],
+                    },
+                }],
+                default: Some(Box::new(Node::App {
+                    func: Box::new(Node::Var("e".into())),
+                    arg: Box::new(Node::Const(byte_n(0))),
+                })),
+            }),
+        }),
+    );
+    let group = Node::FixGroup {
+        defs: vec![even, odd],
+        body: Box::new(Node::App {
+            func: Box::new(Node::Var("e".into())),
+            arg: Box::new(Node::Const(byte_n(1))),
+        }),
+    };
+    let fix_body = Node::Lam {
+        param: "n".into(),
+        body: Box::new(Node::Match {
+            scrutinee: Box::new(Node::Var("n".into())),
+            alts: vec![Alt::Lit {
+                value: byte_n(0),
+                // Base arm: bind+apply the mutual group (nested trampoline).
+                body: group,
+            }],
+            default: Some(Box::new(Node::App {
+                func: Box::new(Node::Var("self".into())),
+                arg: Box::new(Node::Const(byte_n(0))),
+            })),
+        }),
+    };
+    Node::App {
+        func: Box::new(Node::Fix {
+            name: "self".into(),
+            body: Box::new(fix_body),
+        }),
+        arg: Box::new(Node::Const(byte_n(1))),
+    }
+}
+
+#[test]
+fn fixgroup_applied_in_tail_fix_arm_bindings_agrees_b2() {
+    let prog = fixgroup_applied_in_tail_fix_arm_program();
+    let ir = mycelium_mlir::emit_llvm_ir(&prog)
+        .unwrap_or_else(|e| panic!("B2 applied FixGroup-in-arm must emit, got {e}"));
+    // Applying the mutual group is the whole point: it must lower through the nested trampoline
+    // (contrast the unused-suspension case above, which asserts the trampoline is absent).
+    assert!(
+        ir.contains("@myc_tramp_alloc"),
+        "applied FixGroup must lower through the nested trampoline"
+    );
+
+    let native = match mycelium_mlir::compile_and_run(&prog) {
+        Ok(v) => v,
+        Err(AotError::ToolchainMissing(_)) => return,
+        Err(e) => panic!("B2 applied FixGroup-in-arm native errored: {e}"),
+    };
+    let interp =
+        interp_bounded(&prog, 10_000).expect("interp must eval B2 applied FixGroup-in-arm");
+    assert_eq!(
+        observable(&interp),
+        observable(&native),
+        "B2 applied FixGroup-in-arm: interp={:?} vs native={:?}",
+        interp.payload(),
+        native.payload()
+    );
+    // e(1) → o(0) → bit.not(e(0)) = !0xAA = 0x55.
+    assert_eq!(
+        native.payload(),
+        byte_n(0x55).payload(),
+        "B2 applied FixGroup-in-arm must produce byte(0x55)"
     );
 }
 
@@ -420,16 +617,18 @@ fn diverging_native_is_depth_limit_never_hang() {
     );
 }
 
-/// `FixGroup` (mutual recursion) is always refused with `UnsupportedNode` (never silent — G2).
+/// A top-level `FixGroup` whose members are **not** the canonical `λ.Match` shape remains an
+/// honest `UnsupportedNode` refuse (never silent — G2). Canonical mutual recursion lives on the
+/// trampoline corpus (`tests/recursion_trampoline_differential.rs`); FixGroup-in-arm is Wave B2.
 #[test]
-fn fixgroup_is_unsupported_node() {
+fn non_canonical_fixgroup_is_unsupported_node() {
     let prog = fixgroup_program();
     assert!(
         matches!(
             mycelium_mlir::emit_llvm_ir(&prog),
             Err(AotError::UnsupportedNode(_))
         ),
-        "FixGroup must return UnsupportedNode; got {:?}",
+        "non-canonical FixGroup members must return UnsupportedNode; got {:?}",
         mycelium_mlir::emit_llvm_ir(&prog)
     );
 }
