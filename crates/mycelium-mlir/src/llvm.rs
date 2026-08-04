@@ -2800,6 +2800,30 @@ impl CompiledArtifact {
         }
         decode_result(self.kind, self.width, line.chars())
     }
+
+    /// Copy the compiled executable to `dest` **before** this artifact's backing [`TmpDir`] drops
+    /// (which deletes it — see the struct docs). This is the only public way to extract a compiled
+    /// binary onto disk: [`run`](Self::run) executes in place and never exposes the path, and the
+    /// `TmpDir` field is private. Sets the copy's permissions to `0o755` on unix so the returned path
+    /// is directly executable by a subprocess, not just by this crate's own `Command::new` call
+    /// (S-AOT-NATIVE-COMPILE — frozen signature, `myc build --native --out <path>`'s persistence
+    /// primitive). Returns `dest` unchanged on success.
+    ///
+    /// Non-unix targets get the copy but no explicit chmod — `std::fs::copy` already preserves the
+    /// source file's permission bits on unix (so the chmod below is belt-and-suspenders there), but
+    /// this has not been verified on a non-Linux/non-glibc target in this session (a documented,
+    /// open risk — see PKG-WP9-AOT provenance).
+    pub fn persist(&self, dest: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        std::fs::copy(&self.bin, dest)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(dest)?.permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(dest, perm)?;
+        }
+        Ok(dest.to_path_buf())
+    }
 }
 
 /// Compile the bit/trit-subset program to a native executable (emit LLVM IR → `llc` → `clang`)
